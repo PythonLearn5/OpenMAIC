@@ -7,6 +7,8 @@ import {
   getThinkingDisplayValue,
   normalizeThinkingConfig,
   supportsConfigurableThinking,
+  thinkingCapabilityWithoutEffort,
+  withoutThinkingEffort,
 } from '@/lib/ai/thinking-config';
 import type { ProviderId } from '@/lib/types/provider';
 
@@ -66,7 +68,7 @@ describe('thinking config metadata', () => {
     });
   });
 
-  it('removes deprecated and legacy models from the built-in catalog', () => {
+  it('keeps the curated model catalog current', () => {
     const openaiModels = getProvider('openai')?.models.map((item) => item.id);
     const glmModels = getProvider('glm')?.models.map((item) => item.id);
     const googleModels = getProvider('google')?.models.map((item) => item.id);
@@ -90,22 +92,16 @@ describe('thinking config metadata', () => {
     );
     expect(googleModels).toContain('gemini-3.1-pro-preview');
     expect(googleModels).not.toContain('gemini-3-pro-preview');
-    expect(deepseekModels).toEqual([
-      'deepseek-v4-pro',
-      'deepseek-v4-flash',
-      'deepseek-v4-flash-vision-exp',
-    ]);
+    expect(deepseekModels).toEqual(['deepseek-v4-pro', 'deepseek-flash']);
     // Pin the vision model's capabilities so a regression to vision: false
     // (silently dropping document images during generation) fails this test.
-    const visionModel = getProvider('deepseek')?.models.find(
-      (m) => m.id === 'deepseek-v4-flash-vision-exp',
-    );
+    const visionModel = getProvider('deepseek')?.models.find((m) => m.id === 'deepseek-flash');
     expect(visionModel?.capabilities).toMatchObject({
       streaming: true,
       tools: true,
       vision: true,
     });
-    expect(hunyuanModels).toEqual(['hy3-preview']);
+    expect(hunyuanModels).toEqual(['hy3']);
     expect(minimaxModels).toEqual(['MiniMax-M3', 'MiniMax-M2.7']);
     expect(siliconflowModels).not.toContain('MiniMaxAI/MiniMax-M2');
   });
@@ -324,7 +320,7 @@ describe('thinking config normalization', () => {
   });
 
   it('normalizes Tencent HY3 thinking as no_think/low/high effort levels', () => {
-    const thinking = getThinking('tencent-hunyuan', 'hy3-preview');
+    const thinking = getThinking('tencent-hunyuan', 'hy3');
 
     expect(getDefaultThinkingConfig(thinking)).toEqual({
       mode: 'disabled',
@@ -393,5 +389,55 @@ describe('thinking config normalization', () => {
     });
     expect(getThinkingDisplayValue(thinking, undefined)).toBe('auto');
     expect(getThinkingDisplayValue(thinking, { mode: 'enabled', budgetTokens: 8192 })).toBe('8192');
+  });
+});
+
+describe('withoutThinkingEffort', () => {
+  it('takes the effort out and keeps the rest', () => {
+    expect(withoutThinkingEffort({ mode: 'enabled', effort: 'high', budgetTokens: 1024 })).toEqual({
+      mode: 'enabled',
+      budgetTokens: 1024,
+    });
+    expect(withoutThinkingEffort({ effort: 'high' })).toBeUndefined();
+    expect(withoutThinkingEffort(undefined)).toBeUndefined();
+  });
+
+  it('keeps an effort of none as thinking off unless the mode already says', () => {
+    expect(withoutThinkingEffort({ effort: 'none' })).toEqual({ mode: 'disabled' });
+    expect(withoutThinkingEffort({ effort: 'none', enabled: true })).toEqual({ enabled: true });
+  });
+});
+
+describe('thinkingCapabilityWithoutEffort', () => {
+  it('turns an effort control that can be switched off into on/off', () => {
+    expect(
+      thinkingCapabilityWithoutEffort({
+        control: 'effort',
+        requestAdapter: 'deepseek',
+        effortValues: ['none', 'high', 'max'],
+        defaultEffort: 'high',
+        defaultMode: 'enabled',
+        toggleable: true,
+      }),
+    ).toEqual({
+      control: 'toggle',
+      requestAdapter: 'deepseek',
+      defaultMode: 'enabled',
+      toggleable: true,
+    });
+  });
+
+  it('leaves nothing for an effort control that cannot be switched off, and other controls alone', () => {
+    expect(
+      thinkingCapabilityWithoutEffort({
+        control: 'effort',
+        requestAdapter: 'openai',
+        effortValues: ['low', 'high'],
+        defaultEffort: 'low',
+      }),
+    ).toBeUndefined();
+    const toggle = { control: 'toggle', requestAdapter: 'kimi' } as const;
+    expect(thinkingCapabilityWithoutEffort(toggle)).toBe(toggle);
+    expect(thinkingCapabilityWithoutEffort(undefined)).toBeUndefined();
   });
 });

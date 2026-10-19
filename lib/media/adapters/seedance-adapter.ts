@@ -19,7 +19,6 @@
  * - doubao-seedance-2-0-260128
  * - doubao-seedance-2-0-fast-260128
  * - doubao-seedance-2-0-mini-260615
- * - doubao-seedance-1-5-pro-251215
  * - doubao-seedance-1-0-pro-250528
  * - doubao-seedance-1-0-pro-fast-251015
  * - doubao-seedance-1-0-lite-t2v-250428
@@ -34,7 +33,7 @@ import type {
 } from '../types';
 import { mediaFetchFor } from '../media-fetch';
 import { probeAuth } from '../probe-auth';
-import { runPolledTask } from '../polled-task';
+import { runPolledTask, type PolledTaskControl } from '../polled-task';
 import { assertNotRedirected } from '../redirect-guard';
 import { requireModel } from '../require-model';
 
@@ -49,6 +48,11 @@ const POLL_INTERVAL_MS = 5000;
 function resolveArkRoot(baseUrl: string): string {
   const trimmed = baseUrl.replace(/\/+$/, '');
   return /\/api\//.test(trimmed) ? trimmed : `${trimmed}/api/v3`;
+}
+
+/** The Ark API root a configured base URL (or none, the default host) reaches. */
+export function seedanceApiRoot(baseUrl?: string): string {
+  return resolveArkRoot(baseUrl || DEFAULT_BASE_URL);
 }
 const MAX_POLL_ATTEMPTS = 60; // 5 minutes max
 
@@ -251,6 +255,7 @@ export async function pollSeedanceTask(
 export async function generateWithSeedance(
   config: VideoGenerationConfig,
   options: VideoGenerationOptions,
+  control?: PolledTaskControl,
 ): Promise<VideoGenerationResult> {
   return runPolledTask<VideoGenerationResult>({
     submit: async () => ({
@@ -264,6 +269,7 @@ export async function generateWithSeedance(
     intervalMs: POLL_INTERVAL_MS,
     maxAttempts: MAX_POLL_ATTEMPTS,
     label: 'Seedance video generation',
+    control,
     formatTimeout: ({ taskId, elapsedMs }) =>
       `Seedance video generation timed out after ${elapsedMs / 1000}s (task: ${taskId})`,
   });

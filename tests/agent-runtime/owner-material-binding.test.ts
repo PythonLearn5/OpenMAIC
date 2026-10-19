@@ -20,6 +20,11 @@ import { ensureOwnerMaterialSchema } from '@/lib/persistence/owner-materials';
 // Schema bootstrap is serialized by a PostgreSQL advisory lock on a dedicated
 // connection; the fakes here have no connections, and the lock itself is
 // exercised against a real server in schema-bootstrap-concurrency.pg.test.ts.
+vi.mock('@/lib/server/model-config/runtime', async (original) => ({
+  ...(await original<typeof import('@/lib/server/model-config/runtime')>()),
+  assertWorkspaceModelsAuthorized: vi.fn(async () => {}),
+}));
+
 vi.mock('@/lib/persistence/schema-bootstrap-lock', () => ({
   SCHEMA_BOOTSTRAP_LOCK_KEY: 0,
   withSchemaBootstrapLock: <T>(pool: unknown, body: (queryable: never) => Promise<T>) =>
@@ -86,6 +91,10 @@ async function makeHost() {
       return value;
     },
     delete: async (key) => void bytes.delete(key),
+    deletePrefix: async (prefix: string) => {
+      for (const key of [...bytes.keys()]) if (key.startsWith(prefix)) bytes.delete(key);
+    },
+    list: async () => [],
   });
   const sessionStore = new PgAgentSessionStore(instance, {
     withTransaction: (body) => instance.transaction((tx: Queryable) => body(tx)),
@@ -274,6 +283,13 @@ describe('owner-material binding across sessions', () => {
         sessionBytes.delete(key);
         ownerBytes.delete(key);
       },
+      deletePrefix: async (prefix: string) => {
+        for (const key of [...sessionBytes.keys()])
+          if (key.startsWith(prefix)) sessionBytes.delete(key);
+        for (const key of [...ownerBytes.keys()])
+          if (key.startsWith(prefix)) ownerBytes.delete(key);
+      },
+      list: async () => [],
     });
 
     const loser = await bindOwnerMaterialsToSession('session-race', 'owner-1', ['mat_owner']);

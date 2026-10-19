@@ -28,8 +28,9 @@ import type {
   VideoGenerationResult,
 } from '../types';
 import { mediaFetchFor } from '../media-fetch';
+import { MAX_PROVIDER_MEDIA_BYTES, readResponseBodyWithLimit } from '../bounded-download';
 import { connectivityHttpFailure, connectivityTransportFailure } from '../probe-auth';
-import { runPolledTask, type PollResult } from '../polled-task';
+import { runPolledTask, type PollResult, type PolledTaskControl } from '../polled-task';
 import { requireModel } from '../require-model';
 import { openRouterBaseUrl, openRouterHeaders } from './openrouter-image-adapter';
 
@@ -85,8 +86,11 @@ async function fetchVideoDataUrl(
     throw new Error(`OpenRouter video download failed (${response.status}): ${text}`);
   }
   const mimeType = response.headers.get('content-type') || 'video/mp4';
-  const buffer = await response.arrayBuffer();
-  return `data:${mimeType};base64,${Buffer.from(buffer).toString('base64')}`;
+  const clip = await readResponseBodyWithLimit(response, {
+    maxBytes: MAX_PROVIDER_MEDIA_BYTES,
+    label: 'OpenRouter video download',
+  });
+  return `data:${mimeType};base64,${clip.toString('base64')}`;
 }
 
 /** Map a polled job onto the shared polled-task result union. */
@@ -210,6 +214,7 @@ export async function testOpenRouterVideoConnectivity(
 export async function generateWithOpenRouterVideo(
   config: VideoGenerationConfig,
   options: VideoGenerationOptions,
+  control?: PolledTaskControl,
 ): Promise<VideoGenerationResult> {
   const baseUrl = openRouterBaseUrl(config.baseUrl);
   const model = requireModel(config.model, 'OpenRouter Video');
@@ -254,6 +259,7 @@ export async function generateWithOpenRouterVideo(
     intervalMs: POLL_INTERVAL_MS,
     maxAttempts: MAX_POLL_ATTEMPTS,
     label: 'OpenRouter video generation',
+    control,
     // Cancelling a generation should stop the poll immediately, not after the
     // current 10s sleep elapses.
     ...(options.signal ? { signal: options.signal } : {}),

@@ -22,6 +22,21 @@ vi.mock('@/lib/ai/providers', async (importOriginal) => {
   };
 });
 
+// No openmaic.yml policy here: requests may still name their own provider.
+vi.mock('@/lib/server/model-config/runtime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/server/model-config/runtime')>()),
+  requestProvidersAllowed: () => true,
+  deploymentConfig: () => ({
+    legacy: true,
+    layer: {
+      source: 'deployment',
+      config: {
+        providers: { openai: { preset: 'openai', apiKey: 'server-key', models: ['gpt-5.4-mini'] } },
+      },
+    },
+  }),
+}));
+
 vi.mock('@/lib/server/provider-config', () => ({
   isServerConfiguredProvider: () => mocks.serverManaged,
   resolveApiKey: (_id: string, clientKey: string) => clientKey || 'server-key',

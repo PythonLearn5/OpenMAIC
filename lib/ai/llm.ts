@@ -4,12 +4,27 @@
  * All LLM interactions should go through callLLM / streamLLM.
  */
 
-import { generateText, streamText } from 'ai';
-import type { GenerateTextResult, JSONValue, LanguageModel, StreamTextResult } from 'ai';
+import { APICallError, generateText, streamText, wrapLanguageModel } from 'ai';
+import type {
+  GenerateTextResult,
+  JSONValue,
+  LanguageModel,
+  LanguageModelMiddleware,
+  StreamTextResult,
+} from 'ai';
 import { createLogger } from '@/lib/logger';
 import { PROVIDERS } from './providers';
 import { thinkingContext } from './thinking-context';
 import { isEmptyLlmOutput, shouldFallbackFor, logFallbackFired } from '@/lib/server/llm-fallback';
+import {
+  isNonRetryableHostFailure,
+  isProviderQuotaRefusal,
+} from '@/lib/server/generation-run-hooks/runtime';
+import {
+  attachedModelFallback,
+  type FallbackLoader,
+  type FallbackModel,
+} from '@/lib/ai/model-fallbacks';
 import { getModelMetadataKey } from './model-metadata';
 import { getCanonicalModelId } from './model-aliases';
 import type { ThinkingCapability, ThinkingConfig } from '@/lib/types/provider';
@@ -345,15 +360,23 @@ export async function callLLM<T extends GenerateTextParams>(
   // to burn the operator's fallback key, so an absent stamp means NOT armed.
   // verify-model additionally probes the exact primary model, so it never
   // falls back either.
+  // A model resolved through a slot carries its slot's fallback, which is
+  // server configuration by construction: that is authorization enough. The
+  // serverManaged stamp gates only MODEL_FALLBACK on the request path.
+  const attached = attachedModelFallback(params.model);
   const allowFallback =
     fallbackOptions?.enabled !== false &&
-    fallbackOptions?.serverManaged === true &&
+    (attached !== undefined || fallbackOptions?.serverManaged === true) &&
     source !== 'verify-model';
   // Resolve the fallback once up front. The empty-output safety net below only
   // arms when a fallback model is actually configured; without this gate an
   // empty result would flip from success to failure for operators who never
-  // set MODEL_FALLBACK or a MODEL_ROUTES fallback.
-  const fallback = allowFallback ? await resolveFallbackModelSafe(source) : null;
+  // configured one. A model resolved through a slot brings its slot's
+  // fallback (possibly none); only a model from the older request path falls
+  // back to MODEL_FALLBACK.
+  const fallback = allowFallback
+    ? await (attached ? loadFallbackSafe(attached, source) : resolveFallbackModelSafe(source))
+    : null;
 
   /** One generateText round for the given params; validates when asked to. */
   async function runRound(
@@ -373,7 +396,7 @@ export async function callLLM<T extends GenerateTextParams>(
       // can read the config and inject vendor-specific body params for
       // OpenAI-compatible providers.
       const result = await thinkingContext.run(effectiveThinking, () =>
-        generateText(injectedParams),
+        generateText(withRetryGate(injectedParams)),
       );
 
       // Record before validating: every attempt that got this far was billed,
@@ -420,13 +443,24 @@ export async function callLLM<T extends GenerateTextParams>(
   let lastResult: GenerateTextResult<any, any> | undefined;
   let lastError: unknown;
   let triggerFallback = false;
+  // The failure that fired the fallback (undefined for an empty output).
+  let fallbackCause: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const round = await runRound(params, `attempt ${attempt}/${maxAttempts}`);
     if (round.ok) return round.result;
     if (round.error !== undefined) {
       lastError = round.error;
-      if (attempt < maxAttempts) {
+      // A host failure no retry helps (lib/server/generation-run-hooks):
+      // no further attempt and no fallback, and it is what the caller gets,
+      // never an earlier attempt's invalid result.
+      if (isNonRetryableHostFailure(round.error)) throw round.error;
+      // An exhausted provider quota: no further attempt on this model, and
+      // what the caller gets unless the fallback answers, never an earlier
+      // attempt's invalid result.
+      const quotaRefused = isProviderQuotaRefusal(round.error);
+      if (quotaRefused) lastResult = undefined;
+      if (!quotaRefused && attempt < maxAttempts) {
         log.warn(
           `[${source}] Call failed (attempt ${attempt}/${maxAttempts}), retrying...`,
           round.error,
@@ -435,7 +469,9 @@ export async function callLLM<T extends GenerateTextParams>(
       }
       if (allowFallback && shouldFallbackFor(round.error, undefined)) {
         triggerFallback = true;
+        fallbackCause = round.error;
       }
+      break;
     } else {
       // Validation failure — keep the last billed result. The fallback is only
       // considered for genuinely empty/whitespace-only output, never for a
@@ -455,12 +491,7 @@ export async function callLLM<T extends GenerateTextParams>(
   if (triggerFallback) {
     if (fallback) {
       const primary = typeof params.model === 'string' ? params.model : getModelId(params);
-      logFallbackFired(
-        source,
-        lastError !== undefined ? 'retryable failure' : 'empty output',
-        primary || '?',
-        fallback.modelString,
-      );
+      logFallbackFired(source, fallbackCause, primary || '?', fallback.modelString);
       // The fallback round is the LAST attempt: run it with no SDK-internal
       // retries on top (a 503 on both models must not cost 3+3 upstream
       // calls), and do not reuse the caller's abort signal — an
@@ -471,8 +502,14 @@ export async function callLLM<T extends GenerateTextParams>(
         'fallback',
       );
       if (round.ok) return round.result;
-      if (round.error !== undefined) lastError = round.error;
-      else lastResult = round.result;
+      if (round.error !== undefined) {
+        // Same rule as the primary attempts: a host failure or an exhausted
+        // quota is what the caller gets, never the primary's empty result.
+        if (isNonRetryableHostFailure(round.error) || isProviderQuotaRefusal(round.error)) {
+          throw round.error;
+        }
+        lastError = round.error;
+      } else lastResult = round.result;
     } else {
       log.warn(`[${source}] fallback requested but none configured; giving up`);
     }
@@ -483,17 +520,314 @@ export async function callLLM<T extends GenerateTextParams>(
   throw lastError;
 }
 
+/** Load a slot's fallback model; never throws (fallback is best-effort). */
+async function loadFallbackSafe(
+  load: FallbackLoader,
+  source: string,
+): Promise<FallbackModel | null> {
+  try {
+    return await load();
+  } catch (err) {
+    log.warn(`[${source}] Fallback model resolution failed, skipping fallback:`, err);
+    return null;
+  }
+}
+
 /** Lazily resolve the fallback model; never throws (fallback is best-effort). */
 async function resolveFallbackModelSafe(
   source: string,
 ): Promise<{ model: LanguageModel; modelString: string } | null> {
   try {
     const { resolveFallbackModel } = await import('@/lib/server/llm-fallback');
-    return await resolveFallbackModel(source);
+    return await resolveFallbackModel();
   } catch (err) {
     log.warn(`[${source}] Fallback model resolution failed, skipping fallback:`, err);
     return null;
   }
+}
+
+type ModelV3 = Parameters<typeof wrapLanguageModel>[0]['model'];
+type StreamResultV3 = Awaited<ReturnType<ModelV3['doStream']>>;
+type StreamPartV3 = StreamResultV3['stream'] extends ReadableStream<infer P> ? P : never;
+
+/**
+ * A provider error the SDK would retry that no retry helps, raised again as
+ * not retryable (the original is its `cause`), so the SDK's built-in retries
+ * stop at it as the generation steps' own retries do: an explicit provider
+ * quota refusal, or a failure the host classified as one no retry helps
+ * (`lib/server/generation-run-hooks`).
+ */
+function retryGatedError(error: unknown): unknown {
+  if (
+    !APICallError.isInstance(error) ||
+    !error.isRetryable ||
+    (!isNonRetryableHostFailure(error) && !isProviderQuotaRefusal(error))
+  ) {
+    return error;
+  }
+  return new APICallError({
+    message: error.message,
+    url: error.url,
+    requestBodyValues: error.requestBodyValues,
+    statusCode: error.statusCode,
+    responseHeaders: error.responseHeaders,
+    responseBody: error.responseBody,
+    cause: error,
+    isRetryable: false,
+    data: error.data,
+  });
+}
+
+/** Models already behind the retry gate. */
+const RETRY_GATED_MODELS = new WeakSet<object>();
+
+/**
+ * `model` with its provider calls (`doGenerate`, `doStream`) behind
+ * {@link retryGatedError}, whatever its specification version (the SDK still
+ * accepts v2 models and adapts them the same way, by delegation). A model id
+ * string is resolved by the SDK itself and is left as it is.
+ *
+ * The gated model delegates every other read to the model itself (functions
+ * bound to it, so class getters and private fields keep working). It is a
+ * proxy over an empty object of its own, not over the model: a proxy's
+ * answers must agree with its target's non-configurable properties, so a
+ * proxy over a frozen model could not answer `doGenerate` with the gate.
+ */
+function retryGatedModel<M>(model: M): M {
+  if (!model || typeof model !== 'object') return model;
+  const target = model as unknown as Record<PropertyKey, unknown>;
+  if (RETRY_GATED_MODELS.has(target)) return model;
+  if (typeof target.doGenerate !== 'function' || typeof target.doStream !== 'function') {
+    return model;
+  }
+  const gate =
+    (property: 'doGenerate' | 'doStream') =>
+    async (...args: unknown[]): Promise<unknown> => {
+      try {
+        return await (target[property] as (...a: unknown[]) => Promise<unknown>).apply(
+          target,
+          args,
+        );
+      } catch (error) {
+        throw retryGatedError(error);
+      }
+    };
+  const gatedCalls = { doGenerate: gate('doGenerate'), doStream: gate('doStream') };
+  const gated = new Proxy(Object.create(null) as object, {
+    get(_own, property) {
+      if (property === 'doGenerate' || property === 'doStream') return gatedCalls[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+    has(_own, property) {
+      return property in target;
+    },
+  });
+  RETRY_GATED_MODELS.add(gated);
+  return gated as unknown as M;
+}
+
+/** A `prepareStep` whose step model goes behind the retry gate too. */
+function retryGatedPrepareStep(prepare: unknown): unknown {
+  if (typeof prepare !== 'function') return prepare;
+  return async (...args: unknown[]) => {
+    const prepared = (await prepare(...args)) as { model?: unknown } | undefined | null;
+    return prepared && prepared.model !== undefined
+      ? { ...prepared, model: retryGatedModel(prepared.model) }
+      : prepared;
+  };
+}
+
+/**
+ * The one place every model call of this module passes through on its way to
+ * the SDK: the call's model, and any model its `prepareStep` picks for a step,
+ * raise a provider error no retry helps ({@link retryGatedError}) as not
+ * retryable, so the SDK does not retry it.
+ */
+function withRetryGate<T extends GenerateTextParams | StreamTextParams>(params: T): T {
+  const record = params as Record<string, unknown>;
+  const gated: Record<string, unknown> = { ...record, model: retryGatedModel(record.model) };
+  for (const key of ['prepareStep', 'experimental_prepareStep']) {
+    if (record[key] !== undefined) gated[key] = retryGatedPrepareStep(record[key]);
+  }
+  return gated as T;
+}
+
+/** Parts a stream may send before its first content (or error). */
+const PREAMBLE_PARTS = new Set(['stream-start', 'response-metadata']);
+
+/**
+ * Read a stream up to its first content or error part, and hand back that part
+ * with a stream that replays everything read so far and then the rest.
+ */
+async function peekFirstPart(
+  stream: ReadableStream<StreamPartV3>,
+): Promise<{ first: StreamPartV3 | undefined; stream: ReadableStream<StreamPartV3> }> {
+  const reader = stream.getReader();
+  const read: StreamPartV3[] = [];
+  let first: StreamPartV3 | undefined;
+  let done = false;
+  while (!first) {
+    const next = await reader.read();
+    if (next.done) {
+      done = true;
+      break;
+    }
+    read.push(next.value);
+    if (!PREAMBLE_PARTS.has(next.value.type)) first = next.value;
+  }
+  const replay = new ReadableStream<StreamPartV3>({
+    async pull(controller) {
+      const buffered = read.shift();
+      if (buffered) return controller.enqueue(buffered);
+      if (done) return controller.close();
+      const next = await reader.read();
+      if (next.done) controller.close();
+      else controller.enqueue(next.value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { first, stream: replay };
+}
+
+/**
+ * Status codes for the transient error types providers send as a stream's
+ * error part (an SSE `error` event), which arrive as plain `{ type, message }`
+ * payloads rather than errors; an authentication or request error keeps its
+ * own type and is not retried.
+ */
+const TRANSIENT_STREAM_ERROR_STATUS: Record<string, number> = {
+  overloaded_error: 529,
+  api_error: 500,
+  rate_limit_error: 429,
+  server_error: 500,
+};
+
+/** A stream's error part as an error the fallback classifier understands. */
+function streamPartError(error: unknown): unknown {
+  if (error instanceof Error || !error || typeof error !== 'object') return error;
+  const payload = ((error as { error?: unknown }).error ?? error) as {
+    type?: unknown;
+    message?: unknown;
+  };
+  const type = typeof payload?.type === 'string' ? payload.type : undefined;
+  const statusCode = type ? TRANSIENT_STREAM_ERROR_STATUS[type] : undefined;
+  if (!statusCode) return error;
+  const message = typeof payload.message === 'string' ? payload.message : type!;
+  return Object.assign(new Error(message), { statusCode, cause: error });
+}
+
+/** What one streamLLM call has seen, across its steps and the SDK's retries. */
+interface StreamFallbackState {
+  /** A content part (text, reasoning, a tool call, ...) reached the caller. */
+  contentStarted: boolean;
+  /** Primary attempts for the current step (the SDK retries a step itself). */
+  primaryAttempts: number;
+  /** The fallback, once it took over: later steps stay on it. */
+  fallback?: FallbackModel;
+  /** The fallback's own failure: never retried, never called again. */
+  fallbackFailure?: { error: unknown };
+  /** The model that served each started step, in order, for usage. */
+  servedBy: ModelV3[];
+}
+
+/** Parts that carry no content (or signal a failure). */
+const NON_CONTENT_PARTS = new Set([...PREAMBLE_PARTS, 'error', 'finish', 'raw']);
+
+/**
+ * The model with its slot's fallback for streaming. The fallback is the last
+ * attempt of a call that has not streamed any content yet: the primary's own
+ * retries (the SDK's `maxRetries`) come first, except after an explicit quota
+ * refusal, then the fallback runs once, with the thinking options built for
+ * it. A failure after content has reached the caller in any step is the
+ * caller's, as before: what was sent cannot be taken back, and a tool that ran
+ * must not run again on another model. Once the fallback took over, the
+ * call's later steps stay on it.
+ */
+function withStreamFallback(
+  model: ModelV3,
+  options: {
+    load: FallbackLoader;
+    source: string;
+    /** The SDK retries of each step (streamText's `maxRetries`, 2 by default). */
+    maxRetries: number;
+    /** The provider options to call the fallback with (thinking built for it). */
+    providerOptionsFor: (fallback: FallbackModel) => unknown;
+    state: StreamFallbackState;
+  },
+): ModelV3 {
+  const { load, source, maxRetries, providerOptionsFor, state } = options;
+
+  /** Mark content as it passes and remember which model served the step. */
+  const track = (result: StreamResultV3, served: ModelV3): StreamResultV3 => {
+    state.servedBy.push(served);
+    const marker = new TransformStream<StreamPartV3, StreamPartV3>({
+      transform(part, controller) {
+        if (!NON_CONTENT_PARTS.has(part.type)) state.contentStarted = true;
+        controller.enqueue(part);
+      },
+    });
+    return { ...result, stream: result.stream.pipeThrough(marker) };
+  };
+
+  const serveFallback = async (
+    fallback: FallbackModel,
+    params: Parameters<ModelV3['doStream']>[0],
+  ): Promise<StreamResultV3> => {
+    if (state.fallbackFailure) throw state.fallbackFailure.error;
+    const served = fallback.model as ModelV3;
+    try {
+      const result = await served.doStream({
+        ...params,
+        providerOptions: providerOptionsFor(fallback) as typeof params.providerOptions,
+      });
+      return track(result, served);
+    } catch (error) {
+      state.fallbackFailure = { error };
+      throw error;
+    }
+  };
+
+  const middleware: LanguageModelMiddleware = {
+    specificationVersion: 'v3',
+    wrapStream: async ({ doStream, params }) => {
+      if (state.fallback) return serveFallback(state.fallback, params);
+      let failure: unknown;
+      try {
+        const result = await doStream();
+        const peeked = await peekFirstPart(result.stream);
+        const firstError =
+          peeked.first?.type === 'error' ? streamPartError(peeked.first.error) : undefined;
+        if (
+          state.contentStarted ||
+          firstError === undefined ||
+          !shouldFallbackFor(firstError, undefined)
+        ) {
+          state.primaryAttempts = 0;
+          return track({ ...result, stream: peeked.stream }, model);
+        }
+        await peeked.stream.cancel().catch(() => undefined);
+        failure = firstError;
+      } catch (error) {
+        if (state.contentStarted || !shouldFallbackFor(error, undefined)) throw error;
+        // The SDK retries a retryable refusal of the primary itself: the
+        // fallback is its last attempt. No retry serves an exhausted quota.
+        state.primaryAttempts += 1;
+        if (APICallError.isInstance(error) && error.isRetryable && !isProviderQuotaRefusal(error)) {
+          if (state.primaryAttempts <= maxRetries) throw error;
+        }
+        failure = error;
+      }
+      const fallback = await loadFallbackSafe(load, source);
+      if (!fallback || typeof fallback.model !== 'object') throw failure;
+      logFallbackFired(source, failure, `${model.provider}:${model.modelId}`, fallback.modelString);
+      state.fallback = fallback;
+      return serveFallback(fallback, params);
+    },
+  };
+  return wrapLanguageModel({ model, middleware });
 }
 
 /**
@@ -509,6 +843,7 @@ export function streamLLM<T extends StreamTextParams>(
   params: T,
   source: string,
   thinking?: ThinkingConfig,
+  fallbackOptions?: { enabled?: boolean },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): StreamTextResult<any, any> {
   // Resolve effective thinking config and wrap in thinkingContext
@@ -520,16 +855,57 @@ export function streamLLM<T extends StreamTextParams>(
   const callerOnFinish = (params as Record<string, unknown>).onFinish as
     | ((event: { totalUsage?: unknown; usage?: unknown }) => void | Promise<void>)
     | undefined;
-  const wrappedParams = {
-    ...params,
-    onFinish: async (event: { totalUsage?: unknown; usage?: unknown }) => {
-      recordUsageSafe(event.totalUsage ?? event.usage, usageMeta);
-      if (callerOnFinish) await callerOnFinish(event);
-    },
-  } as T;
+  const callerOnStepFinish = (params as Record<string, unknown>).onStepFinish as
+    | ((event: { usage?: unknown }) => void | Promise<void>)
+    | undefined;
+
+  // A model resolved through a slot streams with its slot's fallback (see
+  // withStreamFallback); a caller with its own fallback handling opts out.
+  // Its usage is recorded per step, against the model that served the step.
+  const attached =
+    fallbackOptions?.enabled === false ? undefined : attachedModelFallback(params.model);
+  const state: StreamFallbackState = { contentStarted: false, primaryAttempts: 0, servedBy: [] };
+  const streamsWithFallback = attached !== undefined && typeof params.model === 'object';
+  const original = params;
+  let wrappedParams: T;
+  if (streamsWithFallback) {
+    wrappedParams = {
+      ...params,
+      model: withStreamFallback(params.model as ModelV3, {
+        load: attached,
+        source,
+        maxRetries: (params as { maxRetries?: number }).maxRetries ?? 2,
+        providerOptionsFor: (fallback) =>
+          (
+            injectProviderOptions({ ...original, model: fallback.model }, effectiveThinking) as {
+              providerOptions?: unknown;
+            }
+          ).providerOptions,
+        state,
+      }),
+      onStepFinish: async (event: { usage?: unknown }) => {
+        const served = state.servedBy.shift();
+        recordUsageSafe(
+          event.usage,
+          served ? buildUsageMeta({ ...original, model: served }, source) : usageMeta,
+        );
+        if (callerOnStepFinish) await callerOnStepFinish(event);
+      },
+    } as T;
+  } else {
+    wrappedParams = {
+      ...params,
+      onFinish: async (event: { totalUsage?: unknown; usage?: unknown }) => {
+        recordUsageSafe(event.totalUsage ?? event.usage, usageMeta);
+        if (callerOnFinish) await callerOnFinish(event);
+      },
+    } as T;
+  }
 
   const injectedParams = injectProviderOptions(wrappedParams, effectiveThinking);
-  const result = thinkingContext.run(effectiveThinking, () => streamText(injectedParams));
+  const result = thinkingContext.run(effectiveThinking, () =>
+    streamText(withRetryGate(injectedParams)),
+  );
 
   return result;
 }
